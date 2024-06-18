@@ -32,8 +32,12 @@ from .pygplates import FeatureCollection as _FeatureCollection
 from .reconstruction import PlateReconstruction as _PlateReconstruction
 from .tools import EARTH_RADIUS
 from .utils.feature_utils import shapelify_features as _shapelify_features
-from .utils.plot_utils import _clean_polygons, _meridian_from_ax
-from .utils.plot_utils import plot_subduction_teeth as _plot_subduction_teeth
+from .utils.plot_utils import (
+    SubductionTeeth,
+    plot_subduction_teeth as _plot_subduction_teeth,
+    _clean_polygons,
+    _meridian_from_ax,
+)
 
 logger = logging.getLogger("gplately")
 
@@ -1097,7 +1101,13 @@ class PlotTopologies(object):
         return gdf_left, gdf_right
 
     def plot_subduction_teeth(
-        self, ax, spacing=0.07, size=None, aspect=None, color="black", **kwargs
+        self,
+        ax,
+        spacing=None,
+        size=6.0,
+        aspect=1.0,
+        color="black",
+        **kwargs
     ):
         """Plot subduction teeth onto a standard map Projection.
 
@@ -1112,17 +1122,15 @@ class PlotTopologies(object):
             A subclass of `matplotlib.axes.Axes` which represents a map Projection.
             The map should be set at a particular Cartopy projection.
 
-        spacing : float, default=0.07
-            The tessellation threshold (in radians). Parametrises subduction tooth density.
-            Triangles are generated only along line segments with distances that exceed
-            the given threshold `spacing`.
+        spacing : float, optional
+            Teeth spacing, in display units (usually inches). The default
+            of `None` will choose a value based on the teeth size.
 
-        size : float, default=None
-            Length of teeth triangle base (in radians). If kept at `None`, then
-            `size = 0.5*spacing`.
+        size : float, default: 6.0
+            Teeth size in points (alias: `markersize`).
 
-        aspect : float, default=None
-            Aspect ratio of teeth triangles. If kept at `None`, then `aspect = 2/3*size`.
+        aspect : float, default: 1.0
+            Aspect ratio of teeth triangles (height / width).
 
         color : str, default='black'
             The colour of the teeth. By default, it is set to black.
@@ -1150,7 +1158,7 @@ class PlotTopologies(object):
             kwargs.pop("transform")
 
         central_meridian = _meridian_from_ax(ax)
-        tessellate_degrees = np.rad2deg(spacing)
+        tessellate_degrees = 0.1  # should be small enough for any projection
 
         try:
             projection = ax.projection
@@ -1159,18 +1167,6 @@ class PlotTopologies(object):
                 "The ax.projection does not exist. You must set projection to plot Cartopy maps, such as ax = plt.subplot(211, projection=cartopy.crs.PlateCarree())"
             )
             projection = None
-
-        if isinstance(projection, ccrs.PlateCarree):
-            spacing = math.degrees(spacing)
-        else:
-            spacing = spacing * EARTH_RADIUS * 1e3
-
-        if aspect is None:
-            aspect = 2.0 / 3.0
-        if size is None:
-            size = spacing * 0.5
-
-        height = size * aspect
 
         trench_left_features = shapelify_feature_lines(
             self.trench_left,
@@ -1182,28 +1178,14 @@ class PlotTopologies(object):
             tessellate_degrees=tessellate_degrees,
             central_meridian=central_meridian,
         )
-
-        plot_subduction_teeth(
-            trench_left_features,
-            size,
-            "l",
-            height,
-            spacing,
-            projection=projection,
+        return SubductionTeeth(
+            left=trench_left_features,
+            right=trench_right_features,
             ax=ax,
+            size=size,
+            aspect=aspect,
             color=color,
-            **kwargs,
-        )
-        plot_subduction_teeth(
-            trench_right_features,
-            size,
-            "r",
-            height,
-            spacing,
-            projection=projection,
-            ax=ax,
-            color=color,
-            **kwargs,
+            **kwargs
         )
 
     def plot_plate_polygon_by_id(self, ax, plate_id, **kwargs):

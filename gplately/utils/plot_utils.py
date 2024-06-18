@@ -1,105 +1,38 @@
 import logging
 import re
 import warnings
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Union,
+)
 
 import cartopy.crs as ccrs
 import geopandas as gpd
+import matplotlib.path as mpath
 import matplotlib.pyplot as plt
 import numpy as np
-from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box
+from cartopy.mpl.geoaxes import GeoAxes
+from matplotlib.axes import Axes
+from matplotlib.cbook import CallbackRegistry
+from matplotlib.transforms import Affine2D
+from shapely.geometry import (
+    LineString,
+    MultiLineString,
+    MultiPolygon,
+    Point,
+    Polygon,
+    box,
+)
 from shapely.geometry.base import BaseGeometry, BaseMultipartGeometry
 from shapely.ops import linemerge, substring
 
 from .io_utils import get_geometries as _get_geometries
 
 logger = logging.getLogger("gplately")
-
-
-def _tessellate_triangles(
-    geometries,
-    width,
-    polarity="left",
-    height=None,
-    spacing=None,
-    projection=None,
-    transform=None,
-):
-    """Generate subduction teeth triangles for plotting.
-
-    Forms continuous trench geometries and identifies their subduction polarities.
-    Subduction teeth triangles can be customised with a given spacing and width.
-    Their apexes point in the identified polarity directions.
-
-    Parameters
-    ----------
-    geometries : geopandas.GeoDataFrame, sequence of shapely geometries, or str
-        If a `geopandas.GeoDataFrame` is given, its geometry attribute
-        will be used. If `geometries` is a string, it must be the path to
-        a file, which will be loaded with `geopandas.read_file`. Otherwise,
-        `geometries` must be a sequence of shapely geometry objects (instances
-        of the `shapely.geometry.base.BaseGeometry` class).
-    width : float
-        The (approximate) width of the subduction teeth. If a projection is
-        used, this value will be in projected units.
-    polarity : {"left", "l", "right", "r", None}, default "left"
-        The subduction polarity of the geometries. If no polarity is provided,
-        and `geometries` is a `geopandas.GeoDataFrame`, this function will
-        attempt to find a `polarity` column in the data frame and use the
-        values given there. If `polarity` is not manually specified and no
-        appropriate column can be found, an error will be raised.
-    height : float, default None
-        If provided, the height of the subduction teeth. As with `width`,
-        this value should be given in projected units. If no value is given,
-        the height of the teeth will be equal to 0.6 * `width`.
-    spacing : float, default None
-        If provided, the spacing between the subduction teeth. As with
-        `width` and `height`, this value should be given in projected units.
-        If no value is given, `spacing` will default to `width`, producing
-        tightly packed subduction teeth.
-    projection : cartopy.crs.Transform, "auto", or None, default None
-        The projection of the plot. If the plot has no projection, this value
-        can be explicitly given as `None`. The default value is "auto", which
-        will acquire the projection automatically from the plot axes.
-    transform : cartopy.crs.Transform, or None, default None
-        If the plot is projected, a `transform` value is usually needed.
-        Frequently, the appropriate value is an instance of
-        `cartopy.crs.PlateCarree`.
-
-    Returns
-    -------
-    results : list of shapely Polygon objects
-        Subduction teeth generated for the given geometries.
-    """
-    if width <= 0.0:
-        raise ValueError("Invalid `width` argument: {}".format(width))
-    polarity = _parse_polarity(polarity)
-    geometries = _parse_geometries(geometries)
-    if height is None:
-        height = width * 2.0 / 3.0
-    if spacing is None:
-        spacing = width
-
-    if projection is not None:
-        geometries_new = []
-        for i in geometries:
-            geometries_new.extend(_project_geometry(i, projection, transform))
-        geometries = geometries_new
-        del geometries_new
-    geometries = linemerge(geometries)
-    if isinstance(geometries, BaseMultipartGeometry):
-        geometries = list(geometries.geoms)
-    elif isinstance(geometries, BaseGeometry):
-        geometries = [geometries]
-
-    results = _calculate_triangle_vertices(
-        geometries,
-        width,
-        spacing,
-        height,
-        polarity,
-    )
-
-    return results
 
 
 def _project_geometry(geometry, projection, transform=None):
@@ -498,14 +431,30 @@ def _meridian_from_projection(projection):
     return ccrs.PlateCarree().transform_point(x, y, projection)[0]
 
 
+def _transform_distance_axes(d, ax, inverse=False):
+    axes_bbox = ax.get_position()
+    fig_bbox = ax.figure.bbox_inches  # display units (inches)
+
+    axes_width = axes_bbox.width * fig_bbox.width
+    axes_height = axes_bbox.height * fig_bbox.height
+
+    # Take mean in case they're different somehow
+    xlim = ax.get_xlim()
+    x_factor = np.abs(xlim[1] - xlim[0]) / axes_width  # map units per display unit
+    ylim = ax.get_ylim()
+    y_factor = np.abs(ylim[1] - ylim[0]) / axes_height
+    factor = 0.5 * (x_factor + y_factor)
+    if inverse:
+        return d / factor
+    return d * factor
+
+
 def plot_subduction_teeth(
     geometries,
-    width,
+    size,
     polarity=None,
-    height=None,
     spacing=None,
     projection="auto",
-    transform=None,
     ax=None,
     **kwargs,
 ):
@@ -523,38 +472,27 @@ def plot_subduction_teeth(
         a file, which will be loaded with `geopandas.read_file`. Otherwise,
         `geometries` must be a sequence of shapely geometry objects (instances
         of the `shapely.geometry.base.BaseGeometry` class).
-    width : float
-        The (approximate) width of the subduction teeth. If a projection is
-        used, this value will be in projected units.
+    size : float, default: 6.0
+        Teeth size in points (alias: `markersize`).
     polarity : {"left", "l", "right", "r", None}, default None
         The subduction polarity of the geometries. If no polarity is provided,
         and `geometries` is a `geopandas.GeoDataFrame`, this function will
         attempt to find a `polarity` column in the data frame and use the
         values given there. If `polarity` is not manually specified and no
         appropriate column can be found, an error will be raised.
-    height : float, default None
-        If provided, the height of the subduction teeth. As with `width`,
-        this value should be given in projected units. If no value is given,
-        the height of the teeth will be equal to 0.6 * `width`.
-    spacing : float, default None
-        If provided, the spacing between the subduction teeth. As with
-        `width` and `height`, this value should be given in projected units.
-        If no value is given, `spacing` will default to `width`, producing
-        tightly packed subduction teeth.
+    spacing : float, optional
+        Teeth spacing, in display units (usually inches). The default
+        of `None` will choose a value based on the teeth size.
     projection : cartopy.crs.Transform, "auto", or None, default "auto"
         The projection of the plot. If the plot has no projection, this value
         can be explicitly given as `None`. The default value is "auto", which
         will acquire the projection automatically from the plot axes.
-    transform : cartopy.crs.Transform, or None, default None
-        If the plot is projected, a `transform` value is usually needed.
-        Frequently, the appropriate value is an instance of
-        `cartopy.crs.PlateCarree`.
     ax : matplotlib.axes.Axes, or None, default None
         The axes on which the subduction teeth will be drawn. By default,
         the current axes will be acquired using `matplotlib.pyplot.gca`.
     **kwargs
         Any further keyword arguments will be passed to
-        `matplotlib.patches.Polygon`.
+        `gplately.SubductionTeeth`.
 
     Raises
     ------
@@ -562,6 +500,18 @@ def plot_subduction_teeth(
         If `width` <= 0, or if `polarity` is an invalid value or could not
         be determined.
     """
+    if kwargs.pop("width", None) is not None:
+        warnings.warn(
+            "`width` argument is deprecated; use `size` instead",
+            DeprecationWarning,
+        )
+    if kwargs.pop("height", None) is not None:
+        warnings.warn(
+            "`height` argument is deprecated; use `aspect` ("
+            "height / width) instead",
+            DeprecationWarning,
+        )
+
     if ax is None:
         ax = plt.gca()
 
@@ -580,39 +530,297 @@ def plot_subduction_teeth(
                 "Could not automatically determine polarity; "
                 + "it must be defined manually instead."
             )
-        triangles = []
-        for p in geometries[polarity_column].unique():
-            if p.lower() not in {"left", "l", "right", "r"}:
-                continue
-            gdf_polarity = geometries[geometries[polarity_column] == p]
-            triangles.extend(
-                _tessellate_triangles(
-                    gdf_polarity,
-                    width,
-                    p,
-                    height,
-                    spacing,
-                    projection,
-                    transform,
-                )
-            )
+        left = _parse_geometries(
+            geometries[geometries[polarity_column].str.lower().isin({"left", "l"})]
+        )
+        right = _parse_geometries(
+            geometries[geometries[polarity_column].str.lower().isin({"right", "r"})]
+        )
     else:
-        triangles = _tessellate_triangles(
-            geometries,
-            width,
-            polarity,
-            height,
-            spacing,
-            projection,
-            transform,
+        polarity = _parse_polarity(polarity)
+        if polarity == "left":
+            left = _parse_geometries(geometries)
+            right = []
+        else:
+            left = []
+            right = _parse_geometries(geometries)
+    return SubductionTeeth(
+        left=left,
+        right=right,
+        ax=ax,
+        size=size,
+        spacing=spacing,
+        **kwargs
+    )
+
+
+class SubductionTeeth:
+    """Add subduction zone teeth to a map."""
+    def __init__(
+        self,
+        left: Sequence[Union[LineString, MultiLineString]],
+        right: Sequence[Union[LineString, MultiLineString]],
+        ax: Optional[Union[Axes, GeoAxes]] = None,
+        size: float = 6.0,
+        aspect: float = 1.0,
+        spacing: Optional[float] = None,
+        color="black",
+        **kwargs
+    ):
+        """Add subduction zone teeth to a map.
+
+        Parameters
+        ----------
+        left, right : sequence of LineString or MultiLineString
+            Shapely geometries representing the left- and right-polarity
+            subduction zones.
+
+        ax : matplotlib Axes or cartopy GeoAxes, optional
+            The axes on which to plot the subduction zone teeth. If not specified,
+            will use the current axes.
+
+        size : float, default: 6.0
+            Teeth size in points (alias: `markersize`).
+
+        aspect : float, default: 1.0
+            Aspect ratio of teeth triangles (height / width).
+
+        spacing : float, optional
+            Teeth spacing, in display units (usually inches). The default
+            of `None` will choose a value based on the teeth size.
+
+        color : str, default='black'
+            The colour of the teeth (`markerfacecolor` and `markeredgecolor`).
+
+        **kwargs :
+            Further keyword arguments are passed to `matplotlib.pyplot.plot`.
+            See `matplotlib` keyword arguments
+            [here](https://matplotlib.org/stable/api/_as_gen/matplotlib.pyplot.plot.html).
+        """
+        if ax is None:
+            ax = plt.gca()
+        self._ax = ax
+        self._left = self._explode_geometries(left)
+        self._left_projected = None
+        self._right = self._explode_geometries(right)
+        self._right_projected = None
+        self._aspect = float(aspect)
+        self._teeth = []
+
+        if spacing is not None:
+            spacing = float(spacing)
+        self._spacing = spacing
+
+        self._plot_kw = dict(kwargs)
+        keys = self._plot_kw.keys()
+        if "markersize" not in keys:
+            self._plot_kw["markersize"] = size
+        if "facecolor" in keys:
+            self._plot_kw["markerfacecolor"] = self._plot_kw.pop("facecolor")
+        if "edgecolor" in keys:
+            self._plot_kw["markeredgecolor"] = self._plot_kw.pop("edgecolor")
+        if "markerfacecolor" not in keys:
+            self._plot_kw["markerfacecolor"] = color
+        if "markeredgecolor" not in keys:
+            self._plot_kw["markeredgecolor"] = color
+
+        self._triangle = mpath.Path(
+            vertices=[
+                (-0.5, 0),
+                (0.5, 0),
+                (0, self.aspect),
+                (-0.5, 0),
+            ]
         )
 
-    if projection is not None:
-        domain = projection.domain
-        triangles = [domain.intersection(i) for i in triangles]
+        self.ax.set_xlim(*self.ax.get_xlim())
+        self.ax.set_ylim(*self.ax.get_ylim())
+        self._draw_teeth()
 
-    if hasattr(ax, "add_geometries") and projection is not None:
-        ax.add_geometries(triangles, crs=projection, **kwargs)
-    else:
-        for triangle in triangles:
-            ax.fill(*triangle.exterior.xy, **kwargs)
+        self._callbacks = CallbackRegistry()
+        self._callback_ids = set()
+
+        def callback_func(ax):
+            return self._draw_teeth(ax)
+
+        for event in ("xlim_changed", "ylim_changed"):
+            self._callback_ids.add(self._callbacks.connect(event, callback_func))
+        self._ax.callbacks = self._callbacks
+
+    def __del__(self):
+        for callback_id in self._callback_ids:
+            self._callbacks.disconnect(callback_id)
+        del self._ax.callbacks
+
+    def _draw_teeth(self, ax=None):
+        if ax is None:
+            ax = self.ax
+
+        if self._teeth is not None:
+            for i in self._teeth:
+                i.remove()
+        self._teeth = []
+
+        spacing = _transform_distance_axes(self.spacing, self.ax)
+        left = self.left_projected
+        right = self.right_projected
+
+        domain = (ax.transData.inverted().transform_bbox(ax.bbox))
+        domain = box(domain.x0, domain.y0, domain.x1, domain.y1)
+        left = domain.intersection(left)
+        right = domain.intersection(right)
+
+        for polarity, geometries in zip(
+            ("left", "right"),
+            (left, right),
+        ):
+            geometries = self._explode_geometries(geometries)
+            for geometry in geometries:
+                if not isinstance(geometry, BaseGeometry):
+                    continue
+                if geometry.is_empty:
+                    continue
+
+                length = geometry.length
+                geom_points = [Point(i) for i in geometry.coords]
+                cumlen = np.concatenate(
+                    (
+                        [0.0],
+                        np.cumsum(
+                            [
+                                geom_points[i + 1].distance(geom_points[i])
+                                for i in range(len(geom_points) - 1)
+                            ]
+                        )
+                    )
+                )
+                for distance in np.arange(spacing, length, spacing):
+                    point = Point(geometry.interpolate(distance))
+                    after = int(np.where(cumlen >= distance)[0][0])
+                    before = after - 1
+                    p1 = geom_points[before]
+                    p2 = geom_points[after]
+                    normal = np.array([p1.y - p2.y, p2.x - p1.x])
+                    if polarity == "right":
+                        normal *= -1.0
+                    angle = np.arctan2(*(normal[::-1]))
+                    marker = self._triangle.transformed(
+                        Affine2D().rotate_deg(-90).rotate(angle)
+                    )
+                    p = ax.plot(point.x, point.y, marker=marker, **self.plot_kw)
+                    self._teeth.extend(p)
+
+    @staticmethod
+    def _get_default_spacing(markersize: float, aspect: float) -> float:
+        """Default spacing is approximately 2 times triangle width."""
+        width = np.sqrt(2 * markersize / aspect)  # approximately
+        width /= 72  # convert from points to inches
+        spacing = 2 * width
+        return spacing
+
+    @staticmethod
+    def _explode_geometries(geometries):
+        if isinstance(geometries, BaseGeometry):
+            geometries = [geometries]
+        out = []
+        for geometry in geometries:
+            if geometry.is_empty:
+                continue
+            if isinstance(geometry, BaseMultipartGeometry):
+                out.extend(
+                    [
+                        i for i in list(geometry.geoms)
+                        if isinstance(i, BaseGeometry) and not i.is_empty
+                    ]
+                )
+            else:
+                out.append(geometry)
+        return out
+
+    @property
+    def ax(self):
+        return self._ax
+
+    @property
+    def figure(self):
+        return self.ax.figure
+
+    @property
+    def projection(self) -> Optional[ccrs.Projection]:
+        if hasattr(self.ax, "projection"):
+            return self.ax.projection
+        return None
+
+    @property
+    def left(self) -> List[LineString]:
+        return self._left
+
+    @property
+    def left_projected(self) -> List[LineString]:
+        if self.projection is None:
+            return self.left
+        if self._left_projected is None:
+            projected = [self.projection.project_geometry(i) for i in self.left]
+            projected = [
+                i for i in projected
+                if isinstance(i, BaseGeometry) and not i.is_empty
+            ]
+            projected = self._explode_geometries(projected)
+            if len(projected) == 0:
+                self._left_projected = []
+                return self._left_projected
+            merged = linemerge(projected)
+            if hasattr(merged, "geometries"):
+                self._left_projected = list(merged.geometries)
+            else:
+                self._left_projected = [merged]
+        return self._left_projected
+
+    @property
+    def right(self) -> List[LineString]:
+        return self._right
+
+    @property
+    def right_projected(self) -> List[LineString]:
+        if self.projection is None:
+            return self.right
+        if self._right_projected is None:
+            projected = [self.projection.project_geometry(i) for i in self.right]
+            projected = [
+                i for i in projected
+                if isinstance(i, BaseGeometry) and not i.is_empty
+            ]
+            projected = self._explode_geometries(projected)
+            if len(projected) == 0:
+                self._right_projected = []
+                return self._right_projected
+            merged = linemerge(projected)
+            if hasattr(merged, "geometries"):
+                self._right_projected = list(merged.geometries)
+            else:
+                self._right_projected = [merged]
+        return self._right_projected
+
+    @property
+    def spacing(self) -> float:
+        if self._spacing is None:
+            return self._get_default_spacing(
+                self.plot_kw["markersize"],
+                self.aspect,
+            )
+        return self._spacing
+
+    @spacing.setter
+    def spacing(self, x: Optional[float]):
+        if x is not None:
+            x = float(x)
+        self._spacing = x
+        self._draw_teeth()
+
+    @property
+    def aspect(self):
+        return self._aspect
+
+    @property
+    def plot_kw(self) -> Dict[str, Any]:
+        return self._plot_kw
